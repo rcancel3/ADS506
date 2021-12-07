@@ -1,0 +1,355 @@
+---
+title: "Final Project"
+author: "Roberto Cancel"
+date: "11/30/2021"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warnings = FALSE)
+```
+
+## Import Libraries
+
+```{r message=FALSE, warning=FALSE}
+#Import Libraries
+library(readr) # for quick importing of files
+library(readxl) # for importing excel files
+library(dplyr) # for easy data manipulation
+library(ggplot2) # for generating plots
+library(forecast) # for time series analysis
+library(knitr) # for table generation and other functions
+```
+
+## Import the data
+
+```{r message=FALSE, warning=FALSE}
+#read csv and excel files. Suppress warnings due to size of raw datasets
+properties_2016 <- read_csv("properties_2016.csv", col_types = cols())
+properties_2017 <- read_csv('properties_2017.csv', col_types = cols())
+data_dict <- read_excel("zillow_data_dictionary.xlsx")
+train_2016 <- read_csv("train_2016_v2.csv", col_types = cols())
+test_2017 <- read_csv("train_2017.csv", col_types = cols())
+```
+
+# Exploratory Data Analysis
+
+## View the data
+
+```{r}
+head(properties_2016) # 2016 parcel id and housing attributes (described in data_dict) for ALL houses in this market
+```
+### Comment: Contains parcel id and home attribues for ALL houses in this market. We note extensive missing values in properties_2016.
+
+```{r}
+head(properties_2017) # 2017 parcel id and housing attributes (described in data_dict)
+```
+### Comment: Contains parcel id and home attributes for ALL houses in this market. We note extensive missing values in properties_2017.
+
+```{r}
+head(train_2016)
+```
+### Comment: Contains parcel id, log error, and transaction date - needs to be joined with properties_2016. After joining only the properties that sold (have logerror values) will be retained.
+
+```{r}
+head(test_2017)
+```
+### Comment: Contains parcel id, log error, and transaction date - needs to be joined with properties_2017. After joining only the properties that sold (have logerror values) will be retained.
+
+```{r paged.print=TRUE}
+#since this is a dictionary, print as a table for easy reference
+kable(data_dict%>%select(`Housing Feature` = Feature, Description),
+      caption = 'Table 1: List of Attributes with description')
+```
+
+## Describe the data
+
+```{r message=FALSE}
+# Print the size of each data set (rows then columns)
+dim(properties_2016) # Contains 2985217 rows and 58 columns
+dim(properties_2017) # Contains 2985217 rows and 58 columns
+dim(data_dict) # Contains 58 rows and 2 columns
+dim(train_2016) # Contains 90275 rows and 3 columns
+dim(test_2017) # Contains 77613 and 3 columns
+```
+
+```{r}
+# Confirm no duplicates in properties data sets
+uniqueproperties2016 <- unique(properties_2016$parcelid)
+length(uniqueproperties2016) # All unique properties
+
+uniqueproperties2017 <- unique(properties_2017$parcelid)
+length(uniqueproperties2017) # All unique properties
+
+uniquesales2016 <- unique(train_2016$parcelid)
+length(uniquesales2016) # 90275 - 90150 = 125 properties sold more than once in 2016
+
+uniquesales2017 <- unique(test_2017$parcelid)
+length(uniquesales2017)# 77613 - 77414 = 199 properties sold more than once in 2017
+```
+
+```{r}
+# Count missing values in each data set
+sum(is.na(properties_2016))
+sum(is.na(properties_2017))
+sum(is.na(train_2016))
+sum(is.na(test_2017))
+```
+
+## Join Properties to their respective Train/Test Data Sets to retain only sold home data
+
+```{r message=FALSE, warning=FALSE}
+sold_train <- left_join(train_2016, properties_2016, by = "parcelid") # to join by parcelid & only retain sold homes
+sold_test <- left_join(test_2017, properties_2017, by = "parcelid") # to join by parcelid & only retain sold homes
+```
+### Comment: Join the properties & train/test (2016/2017, respectively) by parcel id to retain only the houses sold (with logerror values) before handling missing data.
+  
+### Confirm joined data sets only contain sold homes
+```{r}
+dim(train_2016)
+dim(sold_train)
+
+dim(test_2017)
+dim(sold_test)
+```
+  
+```{r}
+head(sold_train) #visually inspect joined training data set
+```
+  
+```{r}
+head(sold_test) # visually inspect joined test data set
+```
+  
+## Investigate and Handle Missing Values / Feature Redundancy
+  
+```{r message=TRUE, warning=TRUE}
+#Determine the extent of missing data in each data set
+sum(is.na(sold_train)) # 2,537,678 missing values
+sum(is.na(sold_test)) # 2,173,827 missing values
+```
+### Comment: Extensive missing data exists - we will explore the extent of missing data per attribute.
+  
+```{r}
+summary(sold_train) # displays basic descriptive statistics and # of NA's per feature
+```
+### Comment: All missing values are property-specific attributes rather than transactional attributes. We will initially remove all property-specific attributes with 5% or more missing data before complete case analysis.
+  
+```{r}
+na_train <- data.frame(col = as.character(colnames(sold_train)), 
+                    pct_null = colSums(is.na(sold_train))*100/(colSums(is.na(sold_train))+colSums(!is.na(sold_train))))%>%
+  filter(col != 'parcelid')
+
+train <- sold_train[,colnames(sold_train) %in% na_train$col[na_train$pct_null < 5]] #retain attributes w/ <5% missing
+test <- sold_test[,colnames(sold_test) %in% na_train$col[na_train$pct_null < 5]] #retain same attributes in test
+removed <- sold_train[,colnames(sold_train) %in% na_train$col[na_train$pct_null > 5]]
+```
+  
+### Print Rationalized Features
+  
+```{r}
+colnames(removed) # 35 features removed
+```
+  
+### Print Retained Features for further rationalization
+  
+```{r}
+colnames(train) # 24 retained features
+```
+
+## Address Redundcancies in Features
+We notice redundancies in location data (fips, latitude & longitude, regionidcity, regionidcounty, rawcensustractandblock, censustractblock, and regionidzip) we will retain regionzip since it provides city/county information and lat/long are too property-specific.
+  
+We also notice redundancies in propertycountylandusecode, propertylandusetypeid, and landusetypeid. We will retain property landusetypeid.
+
+We also we notice redundancies in bathroomcnt, calculatedbathnbr, and fullbathcnt. We will retain bathroomcnt.
+
+We also notice redundancies in structuretaxvaluedollarcnt, taxvaluedollarcnt, and landtaxvaluedollarcnt. We will retain the cumulative taxvaluedollarcnt.
+
+```{r}
+loc_red <- c("fips", "latitude", "longitude", "regionidcity", "regionidcounty", "rawcensustractandblock", "censustractandblock", "propertycountylandusecode", "calculatedbathnbr", "fullbathcnt", "structuretaxvaluedollarcnt", "landtaxvaluedollarcnt", "assessmentyear" )
+train.df <- train[ , !(names(train) %in% loc_red)]
+test.df <- test[ , !(names(test) %in% loc_red)]
+```
+
+
+### Comment: 
+```{r}
+# Calculate the percentage change in missing data from removing features >5% missing & feature reduction
+sum(is.na(train.df))/sum(is.na(sold_train))-1 *100 # 6,613 missing values
+sum(is.na(test.df))/sum(is.na(sold_test))-1 *100 # 4,343 missing values
+```
+### Comment: Missing data is SIGNIFICANTLY reduced by removing attributes/features with >5% missing values
+
+```{r}
+# Complete Cases
+train_fin <- train.df[complete.cases(train), ]
+test_fin <- test.df[complete.cases(test), ]
+
+# Calculate % of observations retained
+nrow(train_fin)/nrow(train) *100
+nrow(test_fin)/nrow(test) *100
+```
+### Comment: Complete Cases repesent 96.4% of our final training set and 96.9% of our final testing set. Since our data loss is minimal (~3-4%) we will proceed with complete case review rather than imputatino.
+  
+
+## Transform Time variable
+
+```{r message=FALSE, warning=FALSE}
+train.clean <- train_fin%>%
+    group_by(transactiondate)%>%
+  summarise_all(funs(mean)) # shows only the mean value per day rather than each value of the day
+
+test.clean <- test_fin%>%
+  group_by(transactiondate)%>%
+  summarise_all(funs(mean)) # shows only the mean value per day rather than each value of the day
+```
+
+## Outlier Detection
+```{r}
+my_plots <- lapply(names(train.clean), function(var_x){
+  p <-
+    ggplot(train.clean) +
+    aes_string(var_x)
+  if(is.numeric(train.clean[[var_x]])) {
+    p <- p + geom_density()
+  } else {
+    p <- p + geom_bar()
+  }
+})
+my_plots
+```
+  
+## Evaluating the Log Error over time
+  
+```{r}
+zillow.ts <- ts(train.clean, frequency = 365, start=c(2016,1,1))
+logerror <- zillow.ts[,'logerror']
+
+test.ts <- ts(test.clean, frequency = 365, start=c(2017,1,1))
+logerror_test <- test.ts[,'logerror']
+
+ts.plot(logerror, ylab="Log Error",xlab = "Time (in days)", main="Log Error of Zestimate in 2016 by Day", col=4)
+logrerror_mean <- mean(logerror)
+abline( h=logrerror_mean, col="red")
+```
+### Comment: The Log Error resembles white noise with a mean near .01. Also the variance over time is not consistent (note postive and negative spikes centered around the mean) - indicating potential conditional heteroscedacity. We will confirm stationarity be evaluating its trend with linear regression.
+
+```{r}
+#Confirming no trend exists
+fit <- lm(logerror~time(zillow.ts), na.action=NULL)
+summary(fit)
+```
+### Comment: with a statistically insignificant slope coefficient of 0.005 - log error has no trend. This combined with it's consant mean indicates stationarity but with possible conditional heteroscedacity - which will be investigated addressed for the OLS and ARIMA models. 
+
+# Evaluating Log Error over time
+
+```{r}
+par(mar=c(5,4,0,2)+.01)
+Acf(logerror, lag.max = 365)
+```
+```{r}
+par(mar=c(5,4,0,2)+.01)
+Pacf(logerror)
+```
+### Comment: The ACF and PACF tail off - suggesting an ARMA model - like AR(3).
+
+# Model Development:
+```{r, echo=FALSE, warning=FALSE}
+method = c()
+accuracy = list()
+```
+
+## Ordinary Least Squares with backward selection
+
+```{r warning=FALSE}
+library(olsrr)
+library(MASS)
+# stepwise regression
+model <- lm(logerror ~ ., data = train.clean%>%dplyr::select(-transactiondate))
+ols_step_both_p(model,pent=.03, progress= FALSE)
+```
+
+```{r}
+lm.fit <- tslm(logerror ~ propertylandusetypeid+bathroomcnt+taxvaluedollarcnt, data = zillow.ts)
+summary(lm.fit)
+method[1] = 'Ordinary Least Squares'
+accuracy[[1]] = data.frame(accuracy(lm.fit))
+```
+```{r}
+autoplot(logerror, series="Actual") +
+    forecast::autolayer(fitted(lm.fit), series="Predicted")
+```
+```{r}
+checkresiduals(lm.fit)
+```
+
+### Comment: The OLS model explained 19.27% of the variance in the data. The residual plot does not indicate obvious heteroscedasticity since they are approximately normally distributed with a slightly longer left tail. Simple Exponential Smoothing or ARIMA will likely outperform the OLS model.
+
+## Simple Exponential Smoothing
+
+```{r}
+ses.fit <- ses(logerror)
+summary(ses.fit)
+method[2] = 'Simple Exponential Smoothing'
+accuracy[[2]] = data.frame(accuracy(ses.fit))
+```
+### Comment: 
+
+The optimal simple exponential smoothing function for the zillow.ts data uses $\ell_{t} = .0171 y_{t} + (1 -.0171)\ell_{t-1}$ and an initial $\ell$ value of .0112. 
+
+```{r}
+checkresiduals(ses.fit)
+```
+
+## ARIMA
+```{r}
+# Define xreg
+xreg <- as.matrix(zillow.ts[,c('propertylandusetypeid','bathroomcnt','taxvaluedollarcnt','roomcnt')])
+
+arima.fit <- auto.arima(logerror, xreg = xreg)
+
+arima.fit <- Arima(logerror, xreg=xreg, order=c(3,0,0))
+method[3] = 'ARIMA'
+accuracy[[3]] = data.frame(accuracy(arima.fit))
+```
+### Comment: The auto-arima indicated an ARIMA(3,0,0)  model as the best fit.
+```{r}
+autoplot(logerror, series="Actual") +
+    forecast::autolayer(fitted(arima.fit), series="Predicted")
+```    
+```{r}
+checkresiduals(arima.fit)
+```
+## Summary Model Evaluation & Selection:
+
+The fitted values of the ARIMA model follow a similar pattern to the linear model. Fitted values follow a similar, if more conservative, pattern as the observed values and, while there are some outlying residuals, the bulk of the values are clustered around zero. 
+
+```{r}
+mod.health <- bind_rows(accuracy)%>%
+  bind_cols(data.frame(method))%>%
+  dplyr::select(ME, RMSE, MAE, method)
+
+mod.health
+```
+### Comment: ARIMA outperformed OLS with an MAE of 0.0123 vers 0.0124. It should be noted due to technical issues, SES could not be fit with our housing features.
+
+# Forecasting October, November, December of 2017 using the ARIMA.Fit
+```{r warning=FALSE}
+test.zillow.ts <- ts(test.clean, frequency = 365, start=c(2017,1,1))
+test.full <- ts(bind_rows(train.clean, test.clean)%>%
+                  filter(transactiondate %in% c(as.Date('2016-10-01'),as.Date('2016-11-01'),as.Date('2016-12-01'),
+                                                as.Date('2017-10-01'),as.Date('2017-11-01'),as.Date('2017-12-01'))), 
+                frequency = 365, start = c(2016,1,1))
+```
+
+```{r warning=FALSE}
+forecast(arima.fit, xreg = test.full[,c('propertylandusetypeid','bathroomcnt','taxvaluedollarcnt', 'roomcnt')])%>%
+  autoplot()+
+  labs(y = 'LogError')+
+  xlim(2016.85,2017)
+```
+# Conclusion
+The ARIMA and multiple regression models appeared to perform best and th ARIMA model was used to make predictions about out of sample data points.
+
